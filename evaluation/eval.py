@@ -1,17 +1,20 @@
+"""
+RAG evaluation: retrieval metrics (MRR, nDCG, keyword coverage) + LLM-as-a-judge answer scores.
+
+Run one test from the project root:
+    python -m evaluation.eval 0
+"""
+
 import sys
 import math
 from pydantic import BaseModel, Field
-from litellm import completion
-from dotenv import load_dotenv
 
 from evaluation.test import TestQuestion, load_tests
-from implementation.answer import answer_question, fetch_context
+from pro_implementation import config
+from pro_implementation.answer import answer_question, fetch_context
+from pro_implementation.llm import extract_text, generation_config, get_client, with_retry
 
-
-load_dotenv(override=True)
-
-MODEL = "gpt-4.1-nano"
-db_name = "vector_db"
+MODEL = config.JUDGE_MODEL
 
 
 class RetrievalEval(BaseModel):
@@ -113,9 +116,28 @@ def evaluate_retrieval(test: TestQuestion, k: int = 10) -> RetrievalEval:
     )
 
 
+@with_retry(config.JUDGE_MODEL)
+def judge(judge_messages: list[dict]) -> AnswerEval:
+    """Call the Gemini judge with structured output (replaces the old litellm call)."""
+    system = judge_messages[0]["content"]
+    user = judge_messages[1]["content"]
+    response = get_client().models.generate_content(
+        model=MODEL,
+        contents=user,
+        config=generation_config(
+            system_instruction=system,
+            response_mime_type="application/json",
+            response_schema=AnswerEval,
+        ),
+    )
+    if isinstance(response.parsed, AnswerEval):
+        return response.parsed
+    return AnswerEval.model_validate_json(extract_text(response) or "")
+
+
 def evaluate_answer(test: TestQuestion) -> tuple[AnswerEval, str, list]:
     """
-    Evaluate answer quality using LLM-as-a-judge (async).
+    Evaluate answer quality using LLM-as-a-judge.
 
     Args:
         test: TestQuestion object containing question and reference answer
@@ -152,38 +174,51 @@ Provide detailed feedback and scores from 1 (very poor) to 5 (ideal) for each di
         },
     ]
 
-    # Call LLM judge with structured outputs (async)
-    judge_response = completion(model=MODEL, messages=judge_messages, response_format=AnswerEval)
-
-    answer_eval = AnswerEval.model_validate_json(judge_response.choices[0].message.content)
+    answer_eval = judge(judge_messages)
 
     return answer_eval, generated_answer, retrieved_docs
 
 
 def evaluate_all_retrieval():
-    """Evaluate all retrieval tests."""
-    tests = load_tests()
+    """
+    Evaluate retrieval tests (all 150, or config.EVAL_SAMPLE_SIZE of them if set).
+    Yields (test, result, progress); result is None for a test that errored out
+    (e.g. a model ran out of quota) so one bad test doesn't stop the whole run.
+    """
+    tests = load_tests(config.EVAL_SAMPLE_SIZE or None)
     total_tests = len(tests)
     for index, test in enumerate(tests):
-        result = evaluate_retrieval(test)
+        try:
+            result = evaluate_retrieval(test)
+        except Exception as exc:
+            print(f"[eval] Skipping retrieval test {index} ({test.question[:60]!r}): {exc}")
+            result = None
         progress = (index + 1) / total_tests
         yield test, result, progress
 
 
 def evaluate_all_answers():
-    """Evaluate all answers to tests using batched async execution."""
-    tests = load_tests()
+    """
+    Evaluate answers to tests, one at a time (all 150, or config.EVAL_SAMPLE_SIZE if set).
+    Yields (test, result, progress); result is None for a test that errored out, so one
+    bad test doesn't stop the whole run.
+    """
+    tests = load_tests(config.EVAL_SAMPLE_SIZE or None)
     total_tests = len(tests)
     for index, test in enumerate(tests):
-        result = evaluate_answer(test)[0]
+        try:
+            result = evaluate_answer(test)[0]
+        except Exception as exc:
+            print(f"[eval] Skipping answer test {index} ({test.question[:60]!r}): {exc}")
+            result = None
         progress = (index + 1) / total_tests
         yield test, result, progress
 
 
 def run_cli_evaluation(test_number: int):
-    """Run evaluation for a specific test (async helper for CLI)."""
+    """Run evaluation for a specific test (CLI helper)."""
     # Load tests
-    tests = load_tests("tests.jsonl")
+    tests = load_tests()
 
     if test_number < 0 or test_number >= len(tests):
         print(f"Error: test_row_number must be between 0 and {len(tests) - 1}")
@@ -232,7 +267,7 @@ def run_cli_evaluation(test_number: int):
 def main():
     """CLI to evaluate a specific test by row number."""
     if len(sys.argv) != 2:
-        print("Usage: uv run eval.py <test_row_number>")
+        print("Usage (from the project root): python -m evaluation.eval <test_row_number>")
         sys.exit(1)
 
     try:

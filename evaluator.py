@@ -1,11 +1,14 @@
+"""
+RAG Evaluation Dashboard (Gradio). Run from the project root:
+    python evaluator.py
+"""
+
 import gradio as gr
 import pandas as pd
 from collections import defaultdict
-from dotenv import load_dotenv
 
 from evaluation.eval import evaluate_all_retrieval, evaluate_all_answers
-
-load_dotenv(override=True)
+from gradio_compat import blocks_kwargs, launch_kwargs
 
 # Color coding thresholds - Retrieval
 MRR_GREEN = 0.9
@@ -83,22 +86,35 @@ def run_retrieval_evaluation(progress=gr.Progress()):
     total_coverage = 0.0
     category_mrr = defaultdict(list)
     count = 0
+    skipped = 0
 
     for test, result, prog_value in evaluate_all_retrieval():
-        count += 1
-        total_mrr += result.mrr
-        total_ndcg += result.ndcg
-        total_coverage += result.keyword_coverage
-
-        category_mrr[test.category].append(result.mrr)
+        if result is None:
+            skipped += 1
+        else:
+            count += 1
+            total_mrr += result.mrr
+            total_ndcg += result.ndcg
+            total_coverage += result.keyword_coverage
+            category_mrr[test.category].append(result.mrr)
 
         # Update progress bar only
-        progress(prog_value, desc=f"Evaluating test {count}...")
+        progress(prog_value, desc=f"Evaluating test {count + skipped}...")
 
-    # Calculate final averages
+    if count == 0:
+        return (
+            "<div style='padding: 20px; text-align: center; color: #c0392b;'>"
+            "All tests failed - check your API key / model names / quota in .env."
+            "</div>",
+            pd.DataFrame(),
+        )
+
+    # Calculate final averages (over the tests that actually succeeded)
     avg_mrr = total_mrr / count
     avg_ndcg = total_ndcg / count
     avg_coverage = total_coverage / count
+
+    status_note = f" ({skipped} skipped due to errors)" if skipped else ""
 
     # Create final summary metrics HTML
     final_html = f"""
@@ -107,7 +123,7 @@ def run_retrieval_evaluation(progress=gr.Progress()):
         {format_metric_html("Normalized DCG (nDCG)", avg_ndcg, "ndcg")}
         {format_metric_html("Keyword Coverage", avg_coverage, "coverage", is_percentage=True)}
         <div style="margin-top: 20px; padding: 10px; background-color: #d4edda; border-radius: 5px; text-align: center; border: 1px solid #c3e6cb;">
-            <span style="font-size: 14px; color: #155724; font-weight: bold;">✓ Evaluation Complete: {count} tests</span>
+            <span style="font-size: 14px; color: #155724; font-weight: bold;">✓ Evaluation Complete: {count} tests{status_note}</span>
         </div>
     </div>
     """
@@ -124,28 +140,41 @@ def run_retrieval_evaluation(progress=gr.Progress()):
 
 
 def run_answer_evaluation(progress=gr.Progress()):
-    """Run answer evaluation and yield updates (async)."""
+    """Run answer evaluation and yield updates."""
     total_accuracy = 0.0
     total_completeness = 0.0
     total_relevance = 0.0
     category_accuracy = defaultdict(list)
     count = 0
+    skipped = 0
 
     for test, result, prog_value in evaluate_all_answers():
-        count += 1
-        total_accuracy += result.accuracy
-        total_completeness += result.completeness
-        total_relevance += result.relevance
-
-        category_accuracy[test.category].append(result.accuracy)
+        if result is None:
+            skipped += 1
+        else:
+            count += 1
+            total_accuracy += result.accuracy
+            total_completeness += result.completeness
+            total_relevance += result.relevance
+            category_accuracy[test.category].append(result.accuracy)
 
         # Update progress bar only
-        progress(prog_value, desc=f"Evaluating test {count}...")
+        progress(prog_value, desc=f"Evaluating test {count + skipped}...")
 
-    # Calculate final averages
+    if count == 0:
+        return (
+            "<div style='padding: 20px; text-align: center; color: #c0392b;'>"
+            "All tests failed - check your API key / model names / quota in .env."
+            "</div>",
+            pd.DataFrame(),
+        )
+
+    # Calculate final averages (over the tests that actually succeeded)
     avg_accuracy = total_accuracy / count
     avg_completeness = total_completeness / count
     avg_relevance = total_relevance / count
+
+    status_note = f" ({skipped} skipped due to errors)" if skipped else ""
 
     # Create final summary metrics HTML
     final_html = f"""
@@ -154,7 +183,7 @@ def run_answer_evaluation(progress=gr.Progress()):
         {format_metric_html("Completeness", avg_completeness, "completeness", score_format=True)}
         {format_metric_html("Relevance", avg_relevance, "relevance", score_format=True)}
         <div style="margin-top: 20px; padding: 10px; background-color: #d4edda; border-radius: 5px; text-align: center; border: 1px solid #c3e6cb;">
-            <span style="font-size: 14px; color: #155724; font-weight: bold;">✓ Evaluation Complete: {count} tests</span>
+            <span style="font-size: 14px; color: #155724; font-weight: bold;">✓ Evaluation Complete: {count} tests{status_note}</span>
         </div>
     </div>
     """
@@ -172,9 +201,7 @@ def run_answer_evaluation(progress=gr.Progress()):
 
 def main():
     """Launch the Gradio evaluation app."""
-    theme = gr.themes.Soft(font=["Inter", "system-ui", "sans-serif"])
-
-    with gr.Blocks(title="RAG Evaluation Dashboard", theme=theme) as app:
+    with gr.Blocks(title="RAG Evaluation Dashboard", **blocks_kwargs()) as app:
         gr.Markdown("# 📊 RAG Evaluation Dashboard")
         gr.Markdown("Evaluate retrieval and answer quality for the Insurellm RAG system")
 
@@ -229,7 +256,7 @@ def main():
             outputs=[answer_metrics, answer_chart],
         )
 
-    app.launch(inbrowser=True)
+    app.launch(**launch_kwargs())
 
 
 if __name__ == "__main__":

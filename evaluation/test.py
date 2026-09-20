@@ -14,11 +14,13 @@ class TestQuestion(BaseModel):
     category: str = Field(description="Question category (e.g., direct_fact, spanning, temporal)")
 
 
-def load_tests() -> list[TestQuestion]:
-    """Load test questions from JSONL file."""
+def load_tests(limit: int | None = None) -> list[TestQuestion]:
+    """Load test questions from JSONL file. `limit` keeps only the first N (0/None = all)."""
     tests = []
     with open(TEST_FILE, "r", encoding="utf-8") as f:
         for line in f:
             data = json.loads(line.strip())
             tests.append(TestQuestion(**data))
+    if limit:
+        tests = tests[:limit]
     return tests
