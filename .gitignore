@@ -1,0 +1,22 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# old experiments / course material (kept locally, not part of the app)
+_archive/
+community-contributions/
+
+# LangChain baseline DB (rebuild with: python -m implementation.ingest)
+vector_db/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

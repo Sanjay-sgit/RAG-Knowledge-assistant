@@ -1,34 +1,30 @@
-from pathlib import Path
-from openai import OpenAI
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field
-from chromadb import PersistentClient
-from tqdm import tqdm
-from litellm import completion
+"""
+Build the vector store for the advanced RAG pipeline.
+
+    knowledge-base/*.md  ->  Gemini splits each doc into chunks (headline + summary + original text)
+                         ->  Gemini embeddings  ->  Chroma (preprocessed_db, collection "docs")
+
+Run from the project root (takes a while on the free tier, ~80 LLM calls + embedding batches):
+    python -m pro_implementation.ingest
+
+You only need to run this again if the knowledge base changes.
+"""
+
+import os
+import time
 from multiprocessing import Pool
-from tenacity import retry, wait_exponential
 
+from chromadb import PersistentClient
+from pydantic import BaseModel, Field
+from tqdm import tqdm
 
-load_dotenv(override=True)
+from pro_implementation import config
+from pro_implementation.answer import Result
+from pro_implementation.llm import extract_text, generation_config, get_client, with_retry
 
-MODEL = "openai/gpt-4.1-nano"
-
-DB_NAME = str(Path(__file__).parent.parent / "preprocessed_db")
-collection_name = "docs"
-embedding_model = "text-embedding-3-large"
-KNOWLEDGE_BASE_PATH = Path(__file__).parent.parent / "knowledge-base"
-AVERAGE_CHUNK_SIZE = 100
-wait = wait_exponential(multiplier=1, min=10, max=240)
-
-
-WORKERS = 3
-
-openai = OpenAI()
-
-
-class Result(BaseModel):
-    page_content: str
-    metadata: dict
+AVERAGE_CHUNK_SIZE = 500
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", 50))
+EMBED_SLEEP_SECONDS = float(os.getenv("EMBED_SLEEP_SECONDS", 30))  # free-tier friendly pause
 
 
 class Chunk(BaseModel):
@@ -42,7 +38,7 @@ class Chunk(BaseModel):
         description="The original text of this chunk from the provided document, exactly as is, not changed in any way"
     )
 
-    def as_result(self, document):
+    def as_result(self, document: dict) -> Result:
         metadata = {"source": document["source"], "type": document["type"]}
         return Result(
             page_content=self.headline + "\n\n" + self.summary + "\n\n" + self.original_text,
@@ -54,22 +50,26 @@ class Chunks(BaseModel):
     chunks: list[Chunk]
 
 
-def fetch_documents():
-    """A homemade version of the LangChain DirectoryLoader"""
-
+def fetch_documents() -> list[dict]:
+    """A homemade version of the LangChain DirectoryLoader."""
     documents = []
-
-    for folder in KNOWLEDGE_BASE_PATH.iterdir():
-        doc_type = folder.name
-        for file in folder.rglob("*.md"):
-            with open(file, "r", encoding="utf-8") as f:
-                documents.append({"type": doc_type, "source": file.as_posix(), "text": f.read()})
-
+    for folder in sorted(config.KNOWLEDGE_BASE_PATH.iterdir()):
+        if not folder.is_dir():
+            continue
+        for file in sorted(folder.rglob("*.md")):
+            documents.append(
+                {
+                    "type": folder.name,
+                    # store a portable, relative path (not D:/your/disk/...)
+                    "source": file.relative_to(config.KNOWLEDGE_BASE_PATH.parent).as_posix(),
+                    "text": file.read_text(encoding="utf-8"),
+                }
+            )
     print(f"Loaded {len(documents)} documents")
     return documents
 
 
-def make_prompt(document):
+def make_prompt(document: dict) -> str:
     how_many = (len(document["text"]) // AVERAGE_CHUNK_SIZE) + 1
     return f"""
 You take a document and you split the document into overlapping chunks for a KnowledgeBase.
@@ -94,53 +94,69 @@ Respond with the chunks.
 """
 
 
-def make_messages(document):
-    return [
-        {"role": "user", "content": make_prompt(document)},
-    ]
+@with_retry(config.CHAT_MODEL)
+def process_document(document: dict) -> list[Result]:
+    response = get_client().models.generate_content(
+        model=config.CHAT_MODEL,
+        contents=make_prompt(document),
+        config=generation_config(response_mime_type="application/json", response_schema=Chunks),
+    )
+    parsed = response.parsed
+    if not isinstance(parsed, Chunks):
+        parsed = Chunks.model_validate_json(extract_text(response) or "")
+    return [chunk.as_result(document) for chunk in parsed.chunks]
 
 
-@retry(wait=wait)
-def process_document(document):
-    messages = make_messages(document)
-    response = completion(model=MODEL, messages=messages, response_format=Chunks)
-    reply = response.choices[0].message.content
-    doc_as_chunks = Chunks.model_validate_json(reply).chunks
-    return [chunk.as_result(document) for chunk in doc_as_chunks]
-
-
-def create_chunks(documents):
-    """
-    Create chunks using a number of workers in parallel.
-    If you get a rate limit error, set the WORKERS to 1.
-    """
-    chunks = []
-    with Pool(processes=WORKERS) as pool:
-        for result in tqdm(pool.imap_unordered(process_document, documents), total=len(documents)):
+def create_chunks(documents: list[dict]) -> list[Result]:
+    """Create chunks using a number of workers in parallel."""
+    chunks: list[Result] = []
+    workers = config.INGEST_WORKERS
+    if workers <= 1:
+        for document in tqdm(documents, desc="Chunking"):
+            chunks.extend(process_document(document))
+        return chunks
+    with Pool(processes=workers) as pool:
+        for result in tqdm(pool.imap_unordered(process_document, documents), total=len(documents), desc="Chunking"):
             chunks.extend(result)
     return chunks
 
 
-def create_embeddings(chunks):
-    chroma = PersistentClient(path=DB_NAME)
-    if collection_name in [c.name for c in chroma.list_collections()]:
-        chroma.delete_collection(collection_name)
+@with_retry(config.EMBEDDING_MODEL)
+def embed_batch(batch: list[str]) -> list[list[float]]:
+    response = get_client().models.embed_content(model=config.EMBEDDING_MODEL, contents=batch)
+    return [embedding.values for embedding in response.embeddings]
 
+
+def create_embeddings(chunks: list[Result]) -> None:
     texts = [chunk.page_content for chunk in chunks]
-    emb = openai.embeddings.create(model=embedding_model, input=texts).data
-    vectors = [e.embedding for e in emb]
+    vectors: list[list[float]] = []
+    for start in tqdm(range(0, len(texts), EMBED_BATCH_SIZE), desc="Embedding"):
+        vectors.extend(embed_batch(texts[start : start + EMBED_BATCH_SIZE]))
+        if start + EMBED_BATCH_SIZE < len(texts):
+            time.sleep(EMBED_SLEEP_SECONDS)
 
-    collection = chroma.get_or_create_collection(collection_name)
+    # Only replace the old collection once all embeddings succeeded.
+    chroma = PersistentClient(path=config.DB_PATH)
+    if config.COLLECTION_NAME in [c.name for c in chroma.list_collections()]:
+        chroma.delete_collection(config.COLLECTION_NAME)
+    collection = chroma.get_or_create_collection(config.COLLECTION_NAME)
+    collection.add(
+        ids=[str(i) for i in range(len(chunks))],
+        embeddings=vectors,
+        documents=texts,
+        metadatas=[chunk.metadata for chunk in chunks],
+    )
+    print(f"Vectorstore created with {collection.count()} chunks")
 
-    ids = [str(i) for i in range(len(chunks))]
-    metas = [chunk.metadata for chunk in chunks]
 
-    collection.add(ids=ids, embeddings=vectors, documents=texts, metadatas=metas)
-    print(f"Vectorstore created with {collection.count()} documents")
+def main() -> None:
+    get_client()  # fail fast if the API key is missing
+    documents = fetch_documents()
+    chunks = create_chunks(documents)
+    print(f"Total chunks created: {len(chunks)}")
+    create_embeddings(chunks)
+    print("Ingestion complete")
 
 
 if __name__ == "__main__":
-    documents = fetch_documents()
-    chunks = create_chunks(documents)
-    create_embeddings(chunks)
-    print("Ingestion complete")
+    main()

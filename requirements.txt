@@ -1,0 +1,14 @@
+# Insurellm RAG - runtime dependencies (Python 3.11 or 3.12)
+google-genai>=1.50,<3
+chromadb>=1.0,<2          # preprocessed_db was built with chromadb 1.x
+pydantic>=2.7,<3
+tenacity>=8.2
+python-dotenv>=1.0
+httpx>=0.27
+
+# UI + evaluation dashboard
+gradio>=5.40,<7           # app.py works on Gradio 5 and 6
+pandas>=2.0
+
+# ingestion progress bars
+tqdm>=4.66
