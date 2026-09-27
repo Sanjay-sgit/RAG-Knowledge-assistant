@@ -44,7 +44,7 @@ def _mask(key: str) -> str:
 # API key rotation - when one key's free-tier DAILY quota is exhausted (can't be
 # waited out; resets at midnight Pacific), automatically move to the next key in
 # GEMINI_API_KEY / key1, key2, ... (config.get_api_keys()) instead of failing every
-# call until you notice and edit .env by hand. A key that's been marked exhausted
+# call until .env is edited by hand. A key that's been marked exhausted
 # is skipped for the rest of this process, not just retried once.
 # ----------------------------------------------------------------------------
 

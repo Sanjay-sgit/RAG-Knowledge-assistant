@@ -12,8 +12,8 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Load .env from the project root first, then fall back to any .env found higher up
-# (e.g. the parent llm_engineering folder you used during the course).
+# Load .env from the project root first, then fall back to any .env found in a parent
+# directory (useful when this project lives inside a larger workspace).
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 load_dotenv(override=False)
 
@@ -27,7 +27,7 @@ def _bool(name: str, default: bool) -> bool:
 
 
 # --- API key(s) ----------------------------------------------------------------
-# GEMINI_API_KEY is the standard name; "key1" is kept so your existing .env still works.
+# GEMINI_API_KEY is the standard name; GOOGLE_API_KEY and "key1" are accepted as aliases.
 def get_api_key() -> str | None:
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("key1")
 
@@ -58,9 +58,9 @@ def get_api_keys() -> list[str]:
 
 # --- Models --------------------------------------------------------------------
 # Three roles, deliberately on DIFFERENT models so they draw from separate free-tier
-# quotas (each model has its own per-minute AND per-day request budget). If you burn
-# through one model's daily quota, only that role stops working, not the whole app -
-# and you can point any of these at a different model in .env without touching code.
+# quotas (each model has its own per-minute AND per-day request budget). Exhausting
+# one model's daily quota only degrades that role, not the whole app, and any role can
+# be pointed at a different model in .env without touching code.
 #
 #   CHAT_MODEL     - the final answer the user reads. Needs the most capability.
 #   UTILITY_MODEL  - query rewriting + reranking. Called more often, needs less capability.
