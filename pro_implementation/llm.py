@@ -22,6 +22,7 @@ from functools import lru_cache
 import httpx
 from google import genai
 from google.genai import errors as genai_errors
+from google.genai import types
 from tenacity import (
     retry,
     retry_if_exception,
@@ -101,7 +102,11 @@ _clients_lock = threading.Lock()
 def _client_for_key(api_key: str) -> genai.Client:
     with _clients_lock:
         if api_key not in _clients:
-            _clients[api_key] = genai.Client(api_key=api_key)
+            _clients[api_key] = genai.Client(
+                api_key=api_key,
+                # milliseconds; without this a stalled connection can hang forever
+                http_options=types.HttpOptions(timeout=config.GEMINI_HTTP_TIMEOUT_S * 1000),
+            )
         return _clients[api_key]
 
 

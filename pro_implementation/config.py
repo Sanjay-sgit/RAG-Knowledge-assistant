@@ -90,6 +90,17 @@ GEMINI_RPM = _int("GEMINI_RPM", 10)
 # How many parallel LLM calls ingest.py's chunking step makes at once (via multiprocessing).
 # Each worker draws from the SAME per-minute quota, so keep this at 1 on the free tier.
 INGEST_WORKERS = _int("INGEST_WORKERS", 1)
+# Per-HTTP-call timeout for Gemini. The SDK default is "no timeout", so one stalled
+# connection could freeze the (single) web worker forever.
+GEMINI_HTTP_TIMEOUT_S = _int("GEMINI_HTTP_TIMEOUT_S", 30)
+
+# --- Public demo limits (app.py) -----------------------------------------------
+# Every question costs 4 Gemini calls (rewrite, embed, rerank, answer). These caps keep
+# a public link from burning the whole free-tier quota.
+MAX_QUESTION_CHARS = _int("MAX_QUESTION_CHARS", 500)  # longer questions are rejected
+MAX_HISTORY_MESSAGE_CHARS = _int("MAX_HISTORY_MESSAGE_CHARS", 1500)  # earlier turns are trimmed
+DAILY_QUESTION_LIMIT = _int("DAILY_QUESTION_LIMIT", 150)  # whole site, resets at midnight UTC; 0 = no limit
+QUEUE_MAX_SIZE = _int("QUEUE_MAX_SIZE", 20)  # visitors waiting in line; extra ones are told to retry
 
 # --- Evaluation ----------------------------------------------------------------
 # 0 = run all 150 test questions. Set e.g. 10 to try the eval dashboard quickly

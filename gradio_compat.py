@@ -25,10 +25,18 @@ def blocks_kwargs() -> dict:
 
 def launch_kwargs() -> dict:
     """
-    Host/port come from Gradio's own env vars (GRADIO_SERVER_NAME, GRADIO_SERVER_PORT).
-    OPEN_BROWSER=false stops Gradio from trying to open a browser (needed on servers).
+    Locally: host/port come from Gradio's own env vars (GRADIO_SERVER_NAME,
+    GRADIO_SERVER_PORT), default 127.0.0.1:7860, and a browser tab opens.
+
+    On a host such as Render, the platform sets PORT and routes public traffic to it.
+    The app must then listen on 0.0.0.0:$PORT (not localhost) and must not try to
+    open a browser. OPEN_BROWSER=false also disables the browser tab explicitly.
     """
-    kwargs = {"inbrowser": os.getenv("OPEN_BROWSER", "true").lower() in {"1", "true", "yes"}}
+    port = os.getenv("PORT")
+    if port:  # running on a hosting platform
+        kwargs = {"server_name": "0.0.0.0", "server_port": int(port), "inbrowser": False}
+    else:
+        kwargs = {"inbrowser": os.getenv("OPEN_BROWSER", "true").lower() in {"1", "true", "yes"}}
     if GRADIO_MAJOR >= 6:
         kwargs["theme"] = THEME
     return kwargs
