@@ -151,3 +151,12 @@ EVAL_LIVE_SAMPLE = _int("EVAL_LIVE_SAMPLE", 5)  # size selected by default
 EVAL_LIVE_MAX = _int("EVAL_LIVE_MAX", 10)
 # Saved results of the latest full run (`python -m evaluation.run`), shown on /evaluation.
 EVAL_RESULTS_PATH = Path(os.getenv("EVAL_RESULTS_PATH") or PROJECT_ROOT / "evaluation" / "results.json")
+# Sample runs (--sample / EVAL_SAMPLE_SIZE) save here instead, so they never replace the
+# full-run results the public page shows. Local only (git-ignored).
+EVAL_SAMPLE_RESULTS_PATH = Path(
+    os.getenv("EVAL_SAMPLE_RESULTS_PATH") or PROJECT_ROOT / "evaluation" / "results_sample.json"
+)
+# Every scored question, reused by later runs with identical settings (see evaluation/eval.py).
+EVAL_CACHE_PATH = Path(os.getenv("EVAL_CACHE_PATH") or PROJECT_ROOT / "evaluation" / "cache.jsonl")
+# Groq's tokens-per-minute limit for the judge model, used only to suggest a safe GROQ_RPM.
+GROQ_TPM = _int("GROQ_TPM", 8000)

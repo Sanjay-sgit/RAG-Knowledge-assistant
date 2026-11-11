@@ -8,10 +8,12 @@ Full run (all questions, saved for the /evaluation page):
     python -m evaluation.run
 """
 
+import hashlib
 import json
 import math
 import random
 import sys
+import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -22,7 +24,7 @@ from pydantic import BaseModel, Field
 from evaluation.test import TestQuestion, load_tests
 from pro_implementation import config
 from pro_implementation.answer import answer_question, fetch_context
-from pro_implementation.groq_llm import chat_json
+from pro_implementation.groq_llm import chat_json, token_stats
 from pro_implementation.llm import extract_text, generation_config, get_client, with_retry
 
 MODEL = config.JUDGE_MODEL
@@ -239,14 +241,130 @@ class TestResult(BaseModel):
     relevance: float
     answer: str
     feedback: str
+    source: str = "new"  # new = scored now, cache = reused as is, rejudged = saved answer, new judge
 
 
-def evaluate_one(test: TestQuestion, k: int = 10) -> TestResult:
-    """Run the RAG pipeline once and compute retrieval + answer scores for one question."""
+# ----------------------------------------------------------------------------
+# Evaluation cache (local only: evaluation/cache.jsonl, git-ignored)
+#
+# Every scored question is appended as soon as it finishes, together with two
+# fingerprints of the settings that produced it:
+#   pipeline - everything that decides the answer and the retrieved chunks
+#   judge    - the judge model / provider
+# A later run reuses an entry only when the fingerprints match, so results from
+# different settings are never mixed. Same pipeline + different judge -> the saved
+# answer is re-judged (no Gemini calls). Failed questions are never cached, so the next
+# run retries exactly those - a run cut short by a daily limit simply resumes.
+# ----------------------------------------------------------------------------
+
+CACHE_VERSION = 1  # bump when the judge prompt or a scoring formula changes (old entries are then ignored)
+
+
+def _fingerprint(settings: dict) -> str:
+    return hashlib.sha1(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def pipeline_fingerprint() -> str:
+    return _fingerprint(
+        {
+            "v": CACHE_VERSION,
+            "chat": config.CHAT_MODEL,
+            "rewrite": config.REWRITE_MODEL if config.USE_QUERY_REWRITE else None,
+            "rerank": config.UTILITY_MODEL if config.USE_RERANK else None,
+            "embedding": config.EMBEDDING_MODEL,
+            "retrieval_k": config.RETRIEVAL_K,
+            "final_k": config.FINAL_K,
+            "history_turns": config.HISTORY_TURNS,
+            "collection": config.COLLECTION_NAME,
+        }
+    )
+
+
+def judge_fingerprint() -> str:
+    return _fingerprint({"v": CACHE_VERSION, "judge": config.JUDGE_MODEL, "provider": config.JUDGE_PROVIDER})
+
+
+class EvalCache:
+    """Append-only JSONL cache of scored questions, safe to use from several worker threads."""
+
+    def __init__(self, path: Path | None = None):
+        self.path = Path(path or config.EVAL_CACHE_PATH)
+        self.pipeline = pipeline_fingerprint()
+        self.judge = judge_fingerprint()
+        self._lock = threading.Lock()
+        # (pipeline fingerprint, question) -> {judge fingerprint: TestResult}
+        self._entries: dict[tuple[str, str], dict[str, TestResult]] = {}
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                        result = TestResult(**row["result"])
+                        self._entries.setdefault((row["pipeline"], row["question"]), {})[row["judge"]] = result
+                    except (ValueError, KeyError, TypeError):
+                        continue  # skip a damaged line instead of failing the run
+        except OSError:
+            pass  # no cache yet
+
+    def full(self, test: TestQuestion) -> TestResult | None:
+        """Saved result with the same pipeline AND judge."""
+        return self._entries.get((self.pipeline, test.question), {}).get(self.judge)
+
+    def answer_only(self, test: TestQuestion) -> TestResult | None:
+        """Saved result with the same pipeline but another judge (its answer can be re-judged)."""
+        judged = self._entries.get((self.pipeline, test.question), {})
+        return next(iter(judged.values()), None)
+
+    def add(self, result: TestResult) -> None:
+        row = {
+            "pipeline": self.pipeline,
+            "judge": self.judge,
+            "question": result.question,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "result": result.model_dump(exclude={"source"}),
+        }
+        with self._lock:
+            self._entries.setdefault((self.pipeline, result.question), {})[self.judge] = result
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def plan(self, tests: list[TestQuestion]) -> dict[str, int]:
+        """How many of `tests` are fully cached, need only re-judging, or need a full run."""
+        full = sum(1 for t in tests if self.full(t))
+        rejudge = sum(1 for t in tests if not self.full(t) and self.answer_only(t))
+        return {"cached": full, "rejudge": rejudge, "new": len(tests) - full - rejudge}
+
+
+def evaluate_one(test: TestQuestion, k: int = 10, cache: EvalCache | None = None) -> TestResult:
+    """
+    Run the RAG pipeline once and compute retrieval + answer scores for one question.
+    With a cache: reuse a matching saved result, or re-judge a saved answer when only
+    the judge changed; new results are saved as soon as they're scored.
+    """
+    if cache is not None:
+        hit = cache.full(test)
+        if hit is not None:
+            return hit.model_copy(update={"source": "cache"})
+        saved = cache.answer_only(test)
+        if saved is not None:
+            answer_eval = judge(judge_messages_for(test, saved.answer))
+            result = saved.model_copy(
+                update={
+                    "accuracy": answer_eval.accuracy,
+                    "completeness": answer_eval.completeness,
+                    "relevance": answer_eval.relevance,
+                    "feedback": answer_eval.feedback,
+                    "source": "rejudged",
+                }
+            )
+            cache.add(result)
+            return result
+
     generated_answer, retrieved_docs = answer_question(test.question)
     retrieval = retrieval_metrics(test, retrieved_docs, k)
     answer_eval = judge(judge_messages_for(test, generated_answer))
-    return TestResult(
+    result = TestResult(
         question=test.question,
         category=test.category,
         mrr=retrieval.mrr,
@@ -258,21 +376,37 @@ def evaluate_one(test: TestQuestion, k: int = 10) -> TestResult:
         answer=generated_answer,
         feedback=answer_eval.feedback,
     )
+    if cache is not None:
+        cache.add(result)
+    return result
 
 
-def evaluate_many(tests: list[TestQuestion], workers: int | None = None):
+def evaluate_many(tests: list[TestQuestion], workers: int | None = None, cache: EvalCache | None = None):
     """
     Evaluate tests with `workers` questions in flight at once (default EVAL_WORKERS).
     Yields (test, result, done, total) as each finishes; result is None for a test that
     errored out (quota, overloaded model, ...) so one bad test doesn't stop the run.
     Per-minute quota stays safe: every call still waits in its model's shared limiter.
+    Fully cached questions are returned first, without using a worker.
     """
     workers = max(1, workers or config.EVAL_WORKERS)
     total = len(tests)
+    done = 0
+    pending = []
+    for test in tests:
+        hit = cache.full(test) if cache is not None else None
+        if hit is not None:
+            done += 1
+            yield test, hit.model_copy(update={"source": "cache"}), done, total
+        else:
+            pending.append(test)
+    if not pending:
+        return
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(evaluate_one, test): test for test in tests}
-        for done, future in enumerate(as_completed(futures), start=1):
+        futures = {pool.submit(evaluate_one, test, 10, cache): test for test in pending}
+        for future in as_completed(futures):
             test = futures[future]
+            done += 1
             try:
                 result = future.result()
             except Exception as exc:
@@ -285,15 +419,18 @@ def _avg(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-def summarize(results: list[TestResult], skipped: int = 0, duration_s: float = 0.0) -> dict:
+def summarize(results: list[TestResult], skipped: int = 0, duration_s: float = 0.0, sample: bool = False) -> dict:
     """Averages overall and per category, plus the settings the run used."""
     by_category = defaultdict(list)
     for r in results:
         by_category[r.category].append(r)
-    return {
+    summary = {
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "num_tests": len(results),
         "skipped": skipped,
+        "sample": sample,
+        "from_cache": sum(1 for r in results if r.source == "cache"),
+        "rejudged": sum(1 for r in results if r.source == "rejudged"),
         "duration_s": round(duration_s, 1),
         "models": {
             "chat": config.CHAT_MODEL,
@@ -334,6 +471,9 @@ def summarize(results: list[TestResult], skipped: int = 0, duration_s: float = 0
         ],
         "results": [r.model_dump() for r in results],
     }
+    if config.JUDGE_PROVIDER == "groq":
+        summary["judge_tokens"] = token_stats()
+    return summary
 
 
 def save_results(summary: dict, path: Path | None = None) -> Path:

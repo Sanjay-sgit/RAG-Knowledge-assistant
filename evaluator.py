@@ -16,8 +16,8 @@ from collections.abc import Callable
 import gradio as gr
 import pandas as pd
 
-from evaluation.eval import evaluate_many, load_results, random_tests, save_results, summarize
-from evaluation.test import load_tests
+from evaluation.eval import EvalCache, evaluate_many, load_results, random_tests, save_results, summarize
+from evaluation.test import sample_tests
 from gradio_compat import blocks_kwargs, launch_kwargs
 from pro_implementation import config
 
@@ -132,7 +132,7 @@ def run_info_md(summary: dict | None) -> str:
     provider = {"groq": "Groq", "gemini": "Gemini"}.get(m.get("judge_provider", "gemini"), m.get("judge_provider"))
     skipped = f", {summary['skipped']} skipped" if summary.get("skipped") else ""
     return (
-        f"### Latest full run: {summary['num_tests']} questions{skipped}\n"
+        f"### {'Sample run' if summary.get('sample') else 'Latest full run'}: {summary['num_tests']} questions{skipped}\n"
         f"Run on **{summary['created_at'][:10]}** (took {summary.get('duration_s', 0) / 60:.0f} min) · "
         f"answer `{m['chat']}` · rewrite `{m['rewrite']}` · rerank `{m['rerank']}` · "
         f"embeddings `{m['embedding']}` · judge `{m['judge']}` ({provider})"
@@ -361,19 +361,21 @@ def build_evaluation_page(
 
     # ---- Full run (local only) ------------------------------------------------
     if allow_full_run:
-        size = config.EVAL_SAMPLE_SIZE or "all"
+        size = config.EVAL_SAMPLE_SIZE
+        target = config.EVAL_SAMPLE_RESULTS_PATH if size else config.EVAL_RESULTS_PATH
         gr.Markdown(
-            f"### ▶️ Full evaluation (local only)\n"
-            f"Scores **{size}** test questions (EVAL_SAMPLE_SIZE) and saves them to "
-            f"`{config.EVAL_RESULTS_PATH.name}`. About 5 Gemini calls per question."
+            f"### ▶️ Run evaluation (local only)\n"
+            f"Scores **{f'{size} questions spread over all categories' if size else 'all 150 questions'}** "
+            f"(EVAL_SAMPLE_SIZE) and saves them to `{target.name}`. Questions already scored with the "
+            f"same settings are reused from the cache. Command-line alternative: `python -m evaluation.run`."
         )
-        full_button = gr.Button("Run full evaluation", variant="secondary")
+        full_button = gr.Button("Run evaluation", variant="secondary")
 
         def run_full(progress=gr.Progress()):
             results, skipped = [], 0
-            tests = load_tests(config.EVAL_SAMPLE_SIZE or None)
+            tests = sample_tests(size or None)
             started = time.monotonic()
-            for _test, result, done, total in evaluate_many(tests):
+            for _test, result, done, total in evaluate_many(tests, cache=EvalCache()):
                 progress(done / total, desc=f"Scored {done}/{total} questions")
                 if result is None:
                     skipped += 1
@@ -383,8 +385,10 @@ def build_evaluation_page(
                 values = list(saved_values(load_results()))
                 values[0] = "### Latest full run\n**Every question failed - check your API key, model names and quota.**"
                 return tuple(values)
-            new_summary = summarize(results, skipped=skipped, duration_s=time.monotonic() - started)
-            save_results(new_summary)
+            new_summary = summarize(
+                results, skipped=skipped, duration_s=time.monotonic() - started, sample=bool(size)
+            )
+            save_results(new_summary, target)
             return saved_values(new_summary)
 
         full_button.click(run_full, outputs=saved_outputs, concurrency_limit=1)

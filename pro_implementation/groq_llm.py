@@ -37,6 +37,25 @@ class GroqError(RuntimeError):
 _client: httpx.Client | None = None
 _client_lock = threading.Lock()
 
+# Token usage of successful calls in this process (shown at the end of an eval run, to
+# tune GROQ_RPM against Groq's tokens-per-minute limit).
+_usage = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+_usage_lock = threading.Lock()
+
+
+def token_stats() -> dict:
+    """Totals and per-call average of Groq tokens used so far in this process."""
+    with _usage_lock:
+        stats = dict(_usage)
+    stats["avg_tokens_per_call"] = round(stats["total_tokens"] / stats["calls"]) if stats["calls"] else 0
+    return stats
+
+
+def reset_token_stats() -> None:
+    with _usage_lock:
+        for key in _usage:
+            _usage[key] = 0
+
 
 def _http() -> httpx.Client:
     global _client
@@ -135,7 +154,13 @@ def chat_json(model: str, system: str, user: str, schema: type[BaseModel]) -> Ba
     if response.status_code != 200:
         raise _error_from_response(response)
 
-    choice = (response.json().get("choices") or [{}])[0]
+    data = response.json()
+    usage = data.get("usage") or {}
+    with _usage_lock:
+        _usage["calls"] += 1
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            _usage[key] += int(usage.get(key) or 0)
+    choice = (data.get("choices") or [{}])[0]
     content = (choice.get("message") or {}).get("content") or ""
     if choice.get("finish_reason") == "length":
         raise GroqError(

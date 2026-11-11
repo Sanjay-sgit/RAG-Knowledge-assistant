@@ -20,3 +20,8 @@ vector_db/
 .idea/
 .DS_Store
 Thumbs.db
+
+# local evaluation cache and sample results (only full-run results.json is committed)
+evaluation/cache.jsonl
+evaluation/results_sample.json
+evaluation/*.tmp
