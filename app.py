@@ -13,6 +13,9 @@ Public-demo protection (all tunable via env vars, see pro_implementation/config.
 - earlier chat messages are trimmed to MAX_HISTORY_MESSAGE_CHARS
 - at most DAILY_QUESTION_LIMIT questions per day for the whole site
 - visitors see short, friendly errors; full details go to the server log
+
+Pages:  /            chat
+        /evaluation  saved evaluation results + a small live check (evaluator.py)
 """
 
 import datetime
@@ -23,6 +26,7 @@ import time
 import gradio as gr
 from google.genai import errors as genai_errors
 
+from evaluator import build_evaluation_page
 from gradio_compat import blocks_kwargs, chatbot_kwargs, launch_kwargs
 from pro_implementation import config
 from pro_implementation.answer import answer_question, message_text
@@ -44,17 +48,17 @@ class DailyBudget:
         self._day = None
         self._used = 0
 
-    def try_spend(self) -> bool:
-        """Count one question. False if today's limit is already reached."""
+    def try_spend(self, cost: int = 1) -> bool:
+        """Count `cost` questions (a live evaluation check costs several). False if over today's limit."""
         if self.limit <= 0:  # 0 = unlimited
             return True
         with self._lock:
             today = datetime.datetime.now(datetime.timezone.utc).date()
             if today != self._day:
                 self._day, self._used = today, 0
-            if self._used >= self.limit:
+            if self._used + cost > self.limit:
                 return False
-            self._used += 1
+            self._used += cost
             return True
 
 
@@ -140,8 +144,14 @@ def put_message_in_chatbot(message, history):
 # ----------------------------------------------------------------------------
 
 
+# Chat answers and the evaluation page's live check share ONE processing slot, so the
+# server never runs two RAG pipelines at once (protects the per-minute Gemini quota).
+PIPELINE_SLOT = "rag-pipeline"
+
+
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Insurellm Expert Assistant", **blocks_kwargs()) as ui:
+        gr.Navbar(main_page_name="💬 Chat")
         gr.Markdown(
             "# 🏢 Insurellm Expert Assistant\n"
             "Ask me anything about Insurellm, a fictional insurance-tech company "
@@ -170,7 +180,24 @@ def build_ui() -> gr.Blocks:
 
         message.submit(
             put_message_in_chatbot, inputs=[message, chatbot], outputs=[message, chatbot]
-        ).then(chat, inputs=chatbot, outputs=[chatbot, context_markdown])
+        ).then(
+            chat,
+            inputs=chatbot,
+            outputs=[chatbot, context_markdown],
+            concurrency_limit=1,
+            concurrency_id=PIPELINE_SLOT,
+        )
+
+    # Second page at /evaluation: saved results of the latest full run + a small live
+    # check. Full runs (~750 Gemini calls) are local-only, so visitors can't trigger one.
+    with ui.route("📊 Evaluation", "/evaluation"):
+        gr.Navbar(main_page_name="💬 Chat")
+        build_evaluation_page(
+            spend=budget.try_spend,
+            allow_full_run=False,
+            live_max=config.EVAL_LIVE_MAX,
+            concurrency_id=PIPELINE_SLOT,
+        )
 
     # One answer at a time (protects the free per-minute quota); a bounded waiting line.
     ui.queue(max_size=config.QUEUE_MAX_SIZE, default_concurrency_limit=1)

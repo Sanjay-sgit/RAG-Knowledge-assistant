@@ -3,15 +3,26 @@ RAG evaluation: retrieval metrics (MRR, nDCG, keyword coverage) + LLM-as-a-judge
 
 Run one test from the project root:
     python -m evaluation.eval 0
+
+Full run (all questions, saved for the /evaluation page):
+    python -m evaluation.run
 """
 
-import sys
+import json
 import math
+import random
+import sys
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+
 from pydantic import BaseModel, Field
 
 from evaluation.test import TestQuestion, load_tests
 from pro_implementation import config
 from pro_implementation.answer import answer_question, fetch_context
+from pro_implementation.groq_llm import chat_json
 from pro_implementation.llm import extract_text, generation_config, get_client, with_retry
 
 MODEL = config.JUDGE_MODEL
@@ -93,7 +104,11 @@ def evaluate_retrieval(test: TestQuestion, k: int = 10) -> RetrievalEval:
     """
     # Retrieve documents using shared answer module
     retrieved_docs = fetch_context(test.question)
+    return retrieval_metrics(test, retrieved_docs, k)
 
+
+def retrieval_metrics(test: TestQuestion, retrieved_docs: list, k: int = 10) -> RetrievalEval:
+    """MRR, nDCG and keyword coverage for chunks that were already retrieved (no API calls)."""
     # Calculate MRR (average across all keywords)
     mrr_scores = [calculate_mrr(keyword, retrieved_docs) for keyword in test.keywords]
     avg_mrr = sum(mrr_scores) / len(mrr_scores) if mrr_scores else 0.0
@@ -116,9 +131,31 @@ def evaluate_retrieval(test: TestQuestion, k: int = 10) -> RetrievalEval:
     )
 
 
-@with_retry(config.JUDGE_MODEL)
 def judge(judge_messages: list[dict]) -> AnswerEval:
-    """Call the Gemini judge with structured output (replaces the old litellm call)."""
+    """
+    Score an answer with the LLM judge. JUDGE_PROVIDER picks the API:
+    gemini (same keys as the pipeline) or groq (e.g. openai/gpt-oss-120b - a different
+    model family, so the answers aren't graded by the model that wrote them).
+    """
+    if config.JUDGE_PROVIDER == "groq":
+        return _judge_groq(judge_messages)
+    return _judge_gemini(judge_messages)
+
+
+@with_retry(config.JUDGE_MODEL, rpm=config.GROQ_RPM)
+def _judge_groq(judge_messages: list[dict]) -> AnswerEval:
+    """Groq judge with strict structured output."""
+    return chat_json(
+        MODEL,
+        system=judge_messages[0]["content"],
+        user=judge_messages[1]["content"],
+        schema=AnswerEval,
+    )
+
+
+@with_retry(config.JUDGE_MODEL)
+def _judge_gemini(judge_messages: list[dict]) -> AnswerEval:
+    """Gemini judge with structured output (replaces the old litellm call)."""
     system = judge_messages[0]["content"]
     user = judge_messages[1]["content"]
     response = get_client().models.generate_content(
@@ -147,9 +184,13 @@ def evaluate_answer(test: TestQuestion) -> tuple[AnswerEval, str, list]:
     """
     # Get RAG response using shared answer module
     generated_answer, retrieved_docs = answer_question(test.question)
+    answer_eval = judge(judge_messages_for(test, generated_answer))
+    return answer_eval, generated_answer, retrieved_docs
 
-    # LLM judge prompt
-    judge_messages = [
+
+def judge_messages_for(test: TestQuestion, generated_answer: str) -> list[dict]:
+    """The LLM-as-a-judge prompt comparing a generated answer with the reference answer."""
+    return [
         {
             "role": "system",
             "content": "You are an expert evaluator assessing the quality of answers. Evaluate the generated answer by comparing it to the reference answer. Only give 5/5 scores for perfect answers.",
@@ -174,9 +215,150 @@ Provide detailed feedback and scores from 1 (very poor) to 5 (ideal) for each di
         },
     ]
 
-    answer_eval = judge(judge_messages)
 
-    return answer_eval, generated_answer, retrieved_docs
+# ----------------------------------------------------------------------------
+# One-pass evaluation: both retrieval and answer scores from ONE pipeline run.
+#
+# The old flow ran retrieval (rewrite, embed, rerank) once for the retrieval metrics
+# and then the whole pipeline AGAIN for the answer metrics. answer_question() already
+# returns the chunks it used (identical to fetch_context(question)), so scoring them
+# directly gives the same retrieval metrics for ~5 calls per question instead of ~8.
+# ----------------------------------------------------------------------------
+
+
+class TestResult(BaseModel):
+    """All scores for one test question."""
+
+    question: str
+    category: str
+    mrr: float
+    ndcg: float
+    keyword_coverage: float
+    accuracy: float
+    completeness: float
+    relevance: float
+    answer: str
+    feedback: str
+
+
+def evaluate_one(test: TestQuestion, k: int = 10) -> TestResult:
+    """Run the RAG pipeline once and compute retrieval + answer scores for one question."""
+    generated_answer, retrieved_docs = answer_question(test.question)
+    retrieval = retrieval_metrics(test, retrieved_docs, k)
+    answer_eval = judge(judge_messages_for(test, generated_answer))
+    return TestResult(
+        question=test.question,
+        category=test.category,
+        mrr=retrieval.mrr,
+        ndcg=retrieval.ndcg,
+        keyword_coverage=retrieval.keyword_coverage,
+        accuracy=answer_eval.accuracy,
+        completeness=answer_eval.completeness,
+        relevance=answer_eval.relevance,
+        answer=generated_answer,
+        feedback=answer_eval.feedback,
+    )
+
+
+def evaluate_many(tests: list[TestQuestion], workers: int | None = None):
+    """
+    Evaluate tests with `workers` questions in flight at once (default EVAL_WORKERS).
+    Yields (test, result, done, total) as each finishes; result is None for a test that
+    errored out (quota, overloaded model, ...) so one bad test doesn't stop the run.
+    Per-minute quota stays safe: every call still waits in its model's shared limiter.
+    """
+    workers = max(1, workers or config.EVAL_WORKERS)
+    total = len(tests)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(evaluate_one, test): test for test in tests}
+        for done, future in enumerate(as_completed(futures), start=1):
+            test = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                print(f"[eval] Skipping test ({test.question[:60]!r}): {exc}")
+                result = None
+            yield test, result, done, total
+
+
+def _avg(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def summarize(results: list[TestResult], skipped: int = 0, duration_s: float = 0.0) -> dict:
+    """Averages overall and per category, plus the settings the run used."""
+    by_category = defaultdict(list)
+    for r in results:
+        by_category[r.category].append(r)
+    return {
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "num_tests": len(results),
+        "skipped": skipped,
+        "duration_s": round(duration_s, 1),
+        "models": {
+            "chat": config.CHAT_MODEL,
+            "rewrite": config.REWRITE_MODEL,
+            "rerank": config.UTILITY_MODEL,
+            "embedding": config.EMBEDDING_MODEL,
+            "judge": config.JUDGE_MODEL,
+            "judge_provider": config.JUDGE_PROVIDER,
+        },
+        "settings": {
+            "retrieval_k": config.RETRIEVAL_K,
+            "final_k": config.FINAL_K,
+            "query_rewrite": config.USE_QUERY_REWRITE,
+            "rerank": config.USE_RERANK,
+        },
+        "retrieval": {
+            "mrr": _avg([r.mrr for r in results]),
+            "ndcg": _avg([r.ndcg for r in results]),
+            "keyword_coverage": _avg([r.keyword_coverage for r in results]),
+        },
+        "answer": {
+            "accuracy": _avg([r.accuracy for r in results]),
+            "completeness": _avg([r.completeness for r in results]),
+            "relevance": _avg([r.relevance for r in results]),
+        },
+        "by_category": [
+            {
+                "category": category,
+                "count": len(rows),
+                "mrr": _avg([r.mrr for r in rows]),
+                "ndcg": _avg([r.ndcg for r in rows]),
+                "keyword_coverage": _avg([r.keyword_coverage for r in rows]),
+                "accuracy": _avg([r.accuracy for r in rows]),
+                "completeness": _avg([r.completeness for r in rows]),
+                "relevance": _avg([r.relevance for r in rows]),
+            }
+            for category, rows in sorted(by_category.items())
+        ],
+        "results": [r.model_dump() for r in results],
+    }
+
+
+def save_results(summary: dict, path: Path | None = None) -> Path:
+    """Write the summary as JSON (via a temp file, so a crash never leaves half a file)."""
+    path = Path(path or config.EVAL_RESULTS_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def load_results(path: Path | None = None) -> dict | None:
+    """The saved summary of the latest full run, or None if there isn't a valid one."""
+    path = Path(path or config.EVAL_RESULTS_PATH)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def random_tests(n: int) -> list[TestQuestion]:
+    """n random test questions (for the quick live check)."""
+    tests = load_tests()
+    return random.sample(tests, min(max(n, 1), len(tests)))
 
 
 def evaluate_all_retrieval():

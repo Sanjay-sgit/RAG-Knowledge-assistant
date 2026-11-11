@@ -68,9 +68,18 @@ class _KeyRotator:
         with self._lock:
             return self._keys[self._index]
 
-    def rotate(self) -> str:
-        """Mark the current key exhausted and switch to the next non-exhausted one."""
+    def rotate(self, failed_key: str | None = None) -> str:
+        """
+        Mark `failed_key` exhausted and switch to the next non-exhausted key.
+
+        With several requests in flight (eval workers), many of them can fail on the
+        same key at once. Only the first one rotates; for the rest `failed_key` is no
+        longer the active key, so they just retry on the key that is already active
+        instead of wrongly marking a healthy key as exhausted.
+        """
         with self._lock:
+            if failed_key is not None and failed_key != self._keys[self._index]:
+                return self._keys[self._index]  # someone already switched away from it
             dead = self._index
             self._exhausted.add(dead)
             for offset in range(1, len(self._keys) + 1):
@@ -110,9 +119,16 @@ def _client_for_key(api_key: str) -> genai.Client:
         return _clients[api_key]
 
 
+# The key each thread used for its most recent call, so a daily-quota error can be
+# blamed on the key that actually failed (see _KeyRotator.rotate).
+_thread_state = threading.local()
+
+
 def get_client() -> genai.Client:
     """The Gemini client for the currently-active API key (see _KeyRotator)."""
-    return _client_for_key(_rotator().current_key())
+    key = _rotator().current_key()
+    _thread_state.last_key = key
+    return _client_for_key(key)
 
 
 GENERATION_DEFAULTS = {"automatic_function_calling": {"disable": True}}
@@ -180,10 +196,10 @@ _limiters: dict[str, _RateLimiter] = {}
 _limiters_lock = threading.Lock()
 
 
-def _limiter_for(model: str) -> _RateLimiter:
+def _limiter_for(model: str, rpm: int | None = None) -> _RateLimiter:
     with _limiters_lock:
         if model not in _limiters:
-            _limiters[model] = _RateLimiter(config.GEMINI_RPM)
+            _limiters[model] = _RateLimiter(rpm or config.GEMINI_RPM)
         return _limiters[model]
 
 
@@ -193,6 +209,9 @@ def _limiter_for(model: str) -> _RateLimiter:
 
 
 def _is_transient(exc: BaseException) -> bool:
+    # Errors from other providers (groq_llm.GroqError) say themselves whether a retry can help.
+    if getattr(exc, "transient", None) is not None:
+        return bool(exc.transient)
     if isinstance(exc, genai_errors.ServerError):
         return True
     if isinstance(exc, genai_errors.ClientError):
@@ -201,7 +220,9 @@ def _is_transient(exc: BaseException) -> bool:
 
 
 def _server_retry_delay(exc: BaseException) -> float | None:
-    """Read Google's own suggested wait (e.g. 'retry in 34s') from a 429/5xx error."""
+    """Read the server's own suggested wait (Google's 'retry in 34s', Groq's retry-after header)."""
+    if getattr(exc, "retry_after", None) is not None:
+        return float(exc.retry_after) + 1  # small buffer
     body = getattr(exc, "details", None) or {}
     error = body.get("error", body) if isinstance(body, dict) else {}
     for detail in (error or {}).get("details", []) or []:
@@ -220,7 +241,10 @@ def _is_daily_quota_exhausted(exc: BaseException) -> bool:
     as opposed to a per-minute rate limit. A daily quota can't be waited out (it
     resets at midnight Pacific), so this is the signal to switch API keys instead
     of sleeping and retrying the same key.
+    Only Gemini errors count: a Groq (judge) error must never rotate the Gemini keys.
     """
+    if getattr(exc, "provider", None) not in (None, "gemini"):
+        return False
     body = getattr(exc, "details", None) or {}
     error = body.get("error", body) if isinstance(body, dict) else {}
     for detail in (error or {}).get("details", []) or []:
@@ -234,25 +258,27 @@ def _is_daily_quota_exhausted(exc: BaseException) -> bool:
 def _wait_time(retry_state) -> float:
     exc = retry_state.outcome.exception() if retry_state.outcome else None
     if exc is not None and _is_daily_quota_exhausted(exc):
-        _rotator().rotate()
+        _rotator().rotate(getattr(_thread_state, "last_key", None))
         return 0  # new key = a fresh quota bucket, no need to wait before retrying
     hinted = _server_retry_delay(exc) if exc else None
     fallback = wait_exponential(multiplier=2, min=2, max=30)(retry_state)
     return max(hinted, fallback) if hinted is not None else fallback
 
 
-def with_retry(model: str):
+def with_retry(model: str, rpm: int | None = None):
     """
     Decorator factory: throttle calls to `model`'s own per-minute budget and retry
     transient errors (honouring the server's suggested wait), then give up.
 
     Usage:  @with_retry(config.CHAT_MODEL)
+            @with_retry(config.JUDGE_MODEL, rpm=config.GROQ_RPM)   # non-Gemini budget
     Keying the limiter by model name means e.g. CHAT_MODEL and UTILITY_MODEL never
-    throttle each other, since they draw from separate Gemini quotas.
+    throttle each other, since they draw from separate Gemini quotas. `rpm` overrides
+    GEMINI_RPM for that model (only the first call's value counts).
     """
 
     def before(retry_state) -> None:  # tenacity "before" hook: runs before every attempt
-        _limiter_for(model).acquire()
+        _limiter_for(model, rpm).acquire()
 
     def decorator(func):
         return retry(

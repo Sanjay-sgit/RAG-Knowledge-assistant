@@ -14,6 +14,7 @@ Public API (used by app.py, evaluation/eval.py and later the FastAPI service):
 """
 
 import json
+import threading
 from functools import lru_cache
 
 from chromadb import PersistentClient
@@ -52,8 +53,21 @@ class RankOrder(BaseModel):
 # ----------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=1)
+_collection_lock = threading.Lock()
+
+
 def get_collection():
+    """
+    The Chroma collection, opened once per process. The lock matters when several
+    threads ask at the same moment (evaluation workers): without it each would try to
+    open the database at once and one of them can fail.
+    """
+    with _collection_lock:
+        return _open_collection()
+
+
+@lru_cache(maxsize=1)
+def _open_collection():
     chroma = PersistentClient(path=config.DB_PATH)
     try:
         return chroma.get_collection(config.COLLECTION_NAME)
@@ -105,7 +119,27 @@ def format_history(history: list[dict] | None) -> str:
 # ----------------------------------------------------------------------------
 
 
-@with_retry(config.UTILITY_MODEL)
+MAX_REWRITE_CHARS = 300
+
+
+def clean_rewrite(text: str, question: str) -> str:
+    """
+    Keep only the query itself. Smaller models (e.g. Gemma) sometimes add a label
+    ("Query: ..."), quotes or extra lines around the answer.
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not lines:
+        return question
+    query = lines[0].replace("**", "").strip()  # drop markdown bold, e.g. "**Query:** ..."
+    for label in ("search query:", "refined query:", "query:", "refined question:", "question:"):
+        if query.lower().startswith(label):
+            query = query[len(label):].strip()
+            break
+    query = query.strip("\"'`* ").strip()
+    return query[:MAX_REWRITE_CHARS] or question
+
+
+@with_retry(config.REWRITE_MODEL)
 def rewrite_query(question: str, history: list[dict] | None = None) -> str:
     """Rewrite the user's question into a short, specific Knowledge Base query."""
     message = f"""
@@ -124,9 +158,9 @@ If the question refers to something earlier in the conversation (e.g. "he", "tha
 IMPORTANT: Respond ONLY with the precise knowledgebase query, nothing else.
 """
     response = get_client().models.generate_content(
-        model=config.UTILITY_MODEL, contents=message, config=generation_config()
+        model=config.REWRITE_MODEL, contents=message, config=generation_config()
     )
-    return (extract_text(response) or question).strip()
+    return clean_rewrite(extract_text(response), question)
 
 
 @with_retry(config.EMBEDDING_MODEL)
@@ -219,8 +253,8 @@ def fetch_context(question: str, history: list[dict] | None = None) -> list[Resu
     """
     Retrieve the FINAL_K most relevant chunks for a question.
 
-    Query rewrite and reranking are quality boosts, not requirements - if UTILITY_MODEL
-    is out of quota (or errors for any other reason) even after retries, fall back to the
+    Query rewrite and reranking are quality boosts, not requirements - if REWRITE_MODEL /
+    UTILITY_MODEL is out of quota (or errors for any other reason) even after retries, fall back to the
     plain question / original retrieval order instead of failing the whole answer.
     """
     queries = [question]
